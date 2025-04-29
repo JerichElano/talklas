@@ -12,10 +12,11 @@ import soundfile as sf
 import torchaudio
 import wave
 import time
+import re
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime, timedelta
 
 # Configure logging
@@ -34,7 +35,8 @@ models_loaded = False
 loading_in_progress = False
 loading_thread = None
 model_status = {
-    "stt": "not_loaded",
+    "stt_whisper": "not_loaded",
+    "stt_mms": "not_loaded",
     "mt": "not_loaded",
     "tts": "not_loaded"
 }
@@ -42,8 +44,10 @@ error_message = None
 current_tts_language = "tgl"  # Track the current TTS language
 
 # Model instances
-stt_processor = None
-stt_model = None
+whisper_processor = None
+whisper_model = None
+mms_processor = None
+mms_model = None
 mt_model = None
 mt_tokenizer = None
 tts_model = None
@@ -59,6 +63,10 @@ LANGUAGE_MAPPING = {
     "Pangasinan": "pag"
 }
 
+# Define which languages use Whisper vs MMS for STT
+WHISPER_LANGUAGES = {"eng", "tgl"}  # English and Tagalog use Whisper
+MMS_LANGUAGES = {"ceb", "ilo", "war", "pag"}  # Other Philippine languages use MMS
+
 NLLB_LANGUAGE_CODES = {
     "eng": "eng_Latn",
     "tgl": "tgl_Latn",
@@ -67,6 +75,35 @@ NLLB_LANGUAGE_CODES = {
     "war": "war_Latn",
     "pag": "pag_Latn"
 }
+
+# List of inappropriate words/phrases for content filtering
+INAPPROPRIATE_WORDS = [
+    # English inappropriate words
+    "fuck", "shit", "bitch", "ass", "damn", "hell", "bastard", "cunt", "son of a bitch", "dick", "pussy", "motherfucker", 
+    # Philippine languages
+    "agka baboy", "puta", "putang ina", "gago", "tanga", "hayop", "ulol", "lintik", "animal ka",
+    "paki", "pakyu", "yawa", "bungol", "gingan", "yawa ka", "peste", "irig",
+    "pakit", "ayat", "pua", "kayat mo ti agsardeng", "hinampak", "iring ka"
+]
+
+# Function to check for inappropriate content
+def check_inappropriate_content(text: str) -> bool:
+    """
+    Check if the text contains inappropriate content.
+    Returns True if inappropriate content is detected, False otherwise.
+    """
+    # Convert to lowercase for case-insensitive matching
+    text_lower = text.lower()
+    
+    # Check for inappropriate words
+    for word in INAPPROPRIATE_WORDS:
+        # Use word boundary matching to avoid false positives
+        pattern = r'\b' + re.escape(word) + r'\b'
+        if re.search(pattern, text_lower):
+            logger.warning(f"Inappropriate content detected: {word}")
+            return True
+    
+    return False
 
 # Function to save PCM data as a WAV file
 def save_pcm_to_wav(pcm_data: list, sample_rate: int, output_path: str):
@@ -129,38 +166,48 @@ def schedule_cleanup():
 # Function to load models in background
 def load_models_task():
     global models_loaded, loading_in_progress, model_status, error_message
-    global stt_processor, stt_model, mt_model, mt_tokenizer, tts_model, tts_tokenizer
+    global whisper_processor, whisper_model, mms_processor, mms_model
+    global mt_model, mt_tokenizer, tts_model, tts_tokenizer
     
     try:
         loading_in_progress = True
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        # Load STT model (MMS with fallback to Whisper)
-        logger.info("Starting to load STT model...")
-        from transformers import AutoProcessor, AutoModelForCTC, WhisperProcessor, WhisperForConditionalGeneration
+        # Load Whisper STT model for English and Tagalog
+        logger.info("Starting to load Whisper STT model...")
+        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+        
+        try:
+            logger.info("Loading Whisper STT model...")
+            model_status["stt_whisper"] = "loading"
+            whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+            whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+            whisper_model.to(device)
+            logger.info("Whisper STT model loaded successfully")
+            model_status["stt_whisper"] = "loaded"
+        except Exception as whisper_error:
+            logger.error(f"Failed to load Whisper STT model: {str(whisper_error)}")
+            model_status["stt_whisper"] = "failed"
+            error_message = f"Whisper STT model loading failed: {str(whisper_error)}"
+            return
+        
+        # Load MMS STT model for other Philippine languages
+        logger.info("Starting to load MMS STT model...")
+        from transformers import AutoProcessor, AutoModelForCTC
         
         try:
             logger.info("Loading MMS STT model...")
-            model_status["stt"] = "loading"
-            stt_processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
-            stt_model = AutoModelForCTC.from_pretrained("facebook/mms-1b-all")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            stt_model.to(device)
+            model_status["stt_mms"] = "loading"
+            mms_processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
+            mms_model = AutoModelForCTC.from_pretrained("facebook/mms-1b-all")
+            mms_model.to(device)
             logger.info("MMS STT model loaded successfully")
-            model_status["stt"] = "loaded_mms"
+            model_status["stt_mms"] = "loaded"
         except Exception as mms_error:
             logger.error(f"Failed to load MMS STT model: {str(mms_error)}")
-            logger.info("Falling back to Whisper STT model...")
-            try:
-                stt_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-                stt_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-                stt_model.to(device)
-                logger.info("Whisper STT model loaded successfully as fallback")
-                model_status["stt"] = "loaded_whisper"
-            except Exception as whisper_error:
-                logger.error(f"Failed to load Whisper STT model: {str(whisper_error)}")
-                model_status["stt"] = "failed"
-                error_message = f"STT model loading failed: MMS error: {str(mms_error)}, Whisper error: {str(whisper_error)}"
-                return
+            model_status["stt_mms"] = "failed"
+            error_message = f"MMS STT model loading failed: {str(mms_error)}"
+            return
 
         # Load MT model
         logger.info("Starting to load MT model...")
@@ -233,6 +280,84 @@ def start_cleanup_task():
     cleanup_thread.daemon = True
     cleanup_thread.start()
 
+# Function to load or update TTS model for a specific language
+def load_tts_model_for_language(target_code: str) -> bool:
+    """
+    Load or update the TTS model for the specified language.
+    Returns True if successful, False otherwise.
+    """
+    global tts_model, tts_tokenizer, current_tts_language, model_status
+    
+    if target_code not in LANGUAGE_MAPPING.values():
+        logger.error(f"Invalid language code: {target_code}")
+        return False
+    
+    # Skip if the model is already loaded for the target language
+    if current_tts_language == target_code and model_status["tts"].startswith("loaded"):
+        logger.info(f"TTS model for {target_code} is already loaded.")
+        return True
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        logger.info(f"Loading MMS-TTS model for {target_code}...")
+        from transformers import VitsModel, AutoTokenizer
+        tts_model = VitsModel.from_pretrained(f"facebook/mms-tts-{target_code}")
+        tts_tokenizer = AutoTokenizer.from_pretrained(f"facebook/mms-tts-{target_code}")
+        tts_model.to(device)
+        current_tts_language = target_code
+        logger.info(f"TTS model updated to {target_code}")
+        model_status["tts"] = "loaded"
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load TTS model for {target_code}: {str(e)}")
+        try:
+            logger.info("Falling back to MMS-TTS English model...")
+            tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
+            tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
+            tts_model.to(device)
+            current_tts_language = "eng"
+            logger.info("Fallback TTS model loaded successfully")
+            model_status["tts"] = "loaded (fallback)"
+            return True
+        except Exception as e2:
+            logger.error(f"Failed to load fallback TTS model: {str(e2)}")
+            model_status["tts"] = "failed"
+            return False
+
+# Function to synthesize speech from text
+def synthesize_speech(text: str, target_code: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Convert text to speech for the specified language.
+    Returns a tuple of (output_path, error_message).
+    """
+    global tts_model, tts_tokenizer
+    
+    request_id = str(uuid.uuid4())
+    output_path = os.path.join(AUDIO_DIR, f"{request_id}.wav")
+    
+    # Make sure the TTS model is loaded for the target language
+    if not load_tts_model_for_language(target_code):
+        return None, "Failed to load TTS model for the target language"
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        inputs = tts_tokenizer(text, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output = tts_model(**inputs)
+        speech = output.waveform.cpu().numpy().squeeze()
+        speech = (speech * 32767).astype(np.int16)
+        sample_rate = tts_model.config.sampling_rate
+
+        # Save the audio as a WAV file
+        save_pcm_to_wav(speech.tolist(), sample_rate, output_path)
+        logger.info(f"Saved synthesized audio to {output_path}")
+        
+        return output_path, None
+    except Exception as e:
+        error_msg = f"Error during TTS conversion: {str(e)}"
+        logger.error(error_msg)
+        return None, error_msg
+
 # Start the background processes when the app starts
 @app.on_event("startup")
 async def startup_event():
@@ -258,85 +383,6 @@ async def health_check():
         "model_status": model_status,
         "error": error_message
     }
-
-@app.post("/update-languages")
-async def update_languages(source_lang: str = Form(...), target_lang: str = Form(...)):
-    global stt_processor, stt_model, tts_model, tts_tokenizer, current_tts_language
-    
-    if source_lang not in LANGUAGE_MAPPING or target_lang not in LANGUAGE_MAPPING:
-        raise HTTPException(status_code=400, detail="Invalid language selected")
-    
-    source_code = LANGUAGE_MAPPING[source_lang]
-    target_code = LANGUAGE_MAPPING[target_lang]
-    
-    # Update the STT model based on the source language (MMS or Whisper)
-    try:
-        logger.info("Updating STT model for source language...")
-        from transformers import AutoProcessor, AutoModelForCTC, WhisperProcessor, WhisperForConditionalGeneration
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        try:
-            logger.info(f"Loading MMS STT model for {source_code}...")
-            stt_processor = AutoProcessor.from_pretrained("facebook/mms-1b-all")
-            stt_model = AutoModelForCTC.from_pretrained("facebook/mms-1b-all")
-            stt_model.to(device)
-            # Set the target language for MMS
-            if source_code in stt_processor.tokenizer.vocab.keys():
-                stt_processor.tokenizer.set_target_lang(source_code)
-                stt_model.load_adapter(source_code)
-                logger.info(f"MMS STT model updated to {source_code}")
-                model_status["stt"] = "loaded_mms"
-            else:
-                logger.warning(f"Language {source_code} not supported by MMS, using default")
-                model_status["stt"] = "loaded_mms_default"
-        except Exception as mms_error:
-            logger.error(f"Failed to load MMS STT model for {source_code}: {str(mms_error)}")
-            logger.info("Falling back to Whisper STT model...")
-            try:
-                stt_processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-                stt_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
-                stt_model.to(device)
-                logger.info("Whisper STT model loaded successfully as fallback")
-                model_status["stt"] = "loaded_whisper"
-            except Exception as whisper_error:
-                logger.error(f"Failed to load Whisper STT model: {str(whisper_error)}")
-                model_status["stt"] = "failed"
-                error_message = f"STT model update failed: MMS error: {str(mms_error)}, Whisper error: {str(whisper_error)}"
-                return {"status": "failed", "error": error_message}
-    except Exception as e:
-        logger.error(f"Error updating STT model: {str(e)}")
-        model_status["stt"] = "failed"
-        error_message = f"STT model update failed: {str(e)}"
-        return {"status": "failed", "error": error_message}
-    
-    # Update the TTS model based on the target language
-    try:
-        logger.info(f"Loading MMS-TTS model for {target_code}...")
-        from transformers import VitsModel, AutoTokenizer
-        tts_model = VitsModel.from_pretrained(f"facebook/mms-tts-{target_code}")
-        tts_tokenizer = AutoTokenizer.from_pretrained(f"facebook/mms-tts-{target_code}")
-        tts_model.to(device)
-        current_tts_language = target_code
-        logger.info(f"TTS model updated to {target_code}")
-        model_status["tts"] = "loaded"
-    except Exception as e:
-        logger.error(f"Failed to load TTS model for {target_code}: {str(e)}")
-        try:
-            logger.info("Falling back to MMS-TTS English model...")
-            tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
-            tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
-            tts_model.to(device)
-            current_tts_language = "eng"
-            logger.info("Fallback TTS model loaded successfully")
-            model_status["tts"] = "loaded (fallback)"
-        except Exception as e2:
-            logger.error(f"Failed to load fallback TTS model: {str(e2)}")
-            model_status["tts"] = "failed"
-            error_message = f"TTS model loading failed: {str(e)} (fallback also failed: {str(e2)})"
-            return {"status": "failed", "error": error_message}
-    
-    logger.info(f"Updating languages: {source_lang} → {target_lang}")
-    return {"status": f"Languages updated to {source_lang} → {target_lang}"}
 
 @app.post("/translate-text")
 async def translate_text(text: str = Form(...), source_lang: str = Form(...), target_lang: str = Form(...)):
@@ -377,54 +423,24 @@ async def translate_text(text: str = Form(...), source_lang: str = Form(...), ta
     else:
         logger.warning("MT model not loaded, skipping translation")
 
-    # Update TTS model if the target language doesn't match the current TTS language
-    if current_tts_language != target_code:
-        try:
-            logger.info(f"Updating TTS model for {target_code}...")
-            from transformers import VitsModel, AutoTokenizer
-            tts_model = VitsModel.from_pretrained(f"facebook/mms-tts-{target_code}")
-            tts_tokenizer = AutoTokenizer.from_pretrained(f"facebook/mms-tts-{target_code}")
-            tts_model.to(device)
-            current_tts_language = target_code
-            logger.info(f"TTS model updated to {target_code}")
-            model_status["tts"] = "loaded"
-        except Exception as e:
-            logger.error(f"Failed to load TTS model for {target_code}: {str(e)}")
-            try:
-                logger.info("Falling back to MMS-TTS English model...")
-                tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
-                tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
-                tts_model.to(device)
-                current_tts_language = "eng"
-                logger.info("Fallback TTS model loaded successfully")
-                model_status["tts"] = "loaded (fallback)"
-            except Exception as e2:
-                logger.error(f"Failed to load fallback TTS model: {str(e2)}")
-                model_status["tts"] = "failed"
+    # Check for inappropriate content in the source text and translated text
+    is_inappropriate = check_inappropriate_content(text) or check_inappropriate_content(translated_text)
+    if is_inappropriate:
+        logger.warning("Inappropriate content detected in translation request")
 
     # Convert translated text to speech
     output_audio_url = None
-    if model_status["tts"].startswith("loaded") and tts_model is not None and tts_tokenizer is not None:
-        try:
-            inputs = tts_tokenizer(translated_text, return_tensors="pt").to(device)
-            with torch.no_grad():
-                output = tts_model(**inputs)
-            speech = output.waveform.cpu().numpy().squeeze()
-            speech = (speech * 32767).astype(np.int16)
-            sample_rate = tts_model.config.sampling_rate
-
-            # Save the audio as a WAV file
-            output_filename = f"{request_id}.wav"
-            output_path = os.path.join(AUDIO_DIR, output_filename)
-            save_pcm_to_wav(speech.tolist(), sample_rate, output_path)
-            logger.info(f"Saved synthesized audio to {output_path}")
-
-            # Generate a URL to the WAV file
-            output_audio_url = f"https://jerich-talklasapp.hf.space/audio_output/{output_filename}"
-            logger.info("TTS conversion completed")
-        except Exception as e:
-            logger.error(f"Error during TTS conversion: {str(e)}")
-            output_audio_url = None
+    if model_status["tts"].startswith("loaded"):
+        # Load or update TTS model for the target language
+        if load_tts_model_for_language(target_code):
+            try:
+                output_path, error = synthesize_speech(translated_text, target_code)
+                if output_path:
+                    output_filename = os.path.basename(output_path)
+                    output_audio_url = f"https://legendary-halibut-4p76969wqgr27xjw-8000.app.github.dev/audio_output/{output_filename}"
+                    logger.info("TTS conversion completed")
+            except Exception as e:
+                logger.error(f"Error during TTS conversion: {str(e)}")
     
     return {
         "request_id": request_id,
@@ -432,32 +448,54 @@ async def translate_text(text: str = Form(...), source_lang: str = Form(...), ta
         "message": "Translation and TTS completed (or partially completed).",
         "source_text": text,
         "translated_text": translated_text,
-        "output_audio": output_audio_url
+        "output_audio": output_audio_url,
+        "is_inappropriate": is_inappropriate
     }
 
 @app.post("/translate-audio")
 async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form(...), target_lang: str = Form(...)):
     """Endpoint to transcribe, translate, and convert audio to speech"""
-    global stt_processor, stt_model, mt_model, mt_tokenizer, tts_model, tts_tokenizer, current_tts_language
+    global whisper_processor, whisper_model, mms_processor, mms_model
+    global mt_model, mt_tokenizer, tts_model, tts_tokenizer, current_tts_language
     
     if not audio:
         raise HTTPException(status_code=400, detail="No audio file provided")
     if source_lang not in LANGUAGE_MAPPING or target_lang not in LANGUAGE_MAPPING:
         raise HTTPException(status_code=400, detail="Invalid language selected")
     
-    logger.info(f"Translate-audio requested: {audio.filename} from {source_lang} to {target_lang}")
+    source_code = LANGUAGE_MAPPING[source_lang]
+    target_code = LANGUAGE_MAPPING[target_lang]
+    
+    logger.info(f"Translate-audio requested: {audio.filename} from {source_lang} ({source_code}) to {target_lang} ({target_code})")
     request_id = str(uuid.uuid4())
     
-    # Check if STT model is loaded
-    if model_status["stt"] not in ["loaded_mms", "loaded_mms_default", "loaded_whisper"] or stt_processor is None or stt_model is None:
-        logger.warning("STT model not loaded, returning placeholder response")
+    # Determine which STT model to use based on source language
+    use_whisper = source_code in WHISPER_LANGUAGES
+    use_mms = source_code in MMS_LANGUAGES
+    
+    # Check if the appropriate STT model is loaded
+    if use_whisper and (model_status["stt_whisper"] != "loaded" or whisper_processor is None or whisper_model is None):
+        logger.warning("Whisper STT model not loaded for English/Tagalog, returning placeholder response")
         return {
             "request_id": request_id,
             "status": "processing",
-            "message": "STT model not loaded yet. Please try again later.",
+            "message": "Whisper STT model not loaded yet. Please try again later.",
             "source_text": "Transcription not available",
             "translated_text": "Translation not available",
-            "output_audio": None
+            "output_audio": None,
+            "is_inappropriate": False
+        }
+    
+    if use_mms and (model_status["stt_mms"] != "loaded" or mms_processor is None or mms_model is None):
+        logger.warning("MMS STT model not loaded for Philippine languages, returning placeholder response")
+        return {
+            "request_id": request_id,
+            "status": "processing",
+            "message": "MMS STT model not loaded yet. Please try again later.",
+            "source_text": "Transcription not available",
+            "translated_text": "Translation not available",
+            "output_audio": None,
+            "is_inappropriate": False
         }
     
     # Save the uploaded audio to a temporary file
@@ -468,6 +506,7 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
     transcription = "Transcription not available"
     translated_text = "Translation not available"
     output_audio_url = None
+    is_inappropriate = False
     
     try:
         # Step 1: Load and resample the audio using torchaudio
@@ -490,31 +529,49 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
                 "message": "No speech detected in the audio.",
                 "source_text": "No speech detected",
                 "translated_text": "No translation available",
-                "output_audio": None
+                "output_audio": None,
+                "is_inappropriate": False
             }
 
         # Step 3: Transcribe the audio (STT)
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device}")
-        inputs = stt_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
-        logger.info("Audio processed, generating transcription...")
+        logger.info(f"Using device: {device} for STT")
         
-        with torch.no_grad():
-            if model_status["stt"] == "loaded_whisper":
-                # Whisper model
-                generated_ids = stt_model.generate(**inputs, language="en")
-                transcription = stt_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            else:
-                # MMS model
-                logits = stt_model(**inputs).logits
+        if use_whisper:
+            # Use Whisper model for English and Tagalog
+            logger.info(f"Using Whisper model for language: {source_code}")
+            
+            # Prepare audio for Whisper
+            inputs = whisper_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+            logger.info("Audio processed for Whisper, generating transcription...")
+            
+            with torch.no_grad():
+                # For English, we can specify the language; for Tagalog we use 'tl'
+                forced_language = "en" if source_code == "eng" else "tl"
+                generated_ids = whisper_model.generate(
+                    **inputs, 
+                    language=forced_language,
+                    task="transcribe"
+                )
+                transcription = whisper_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        else:
+            # Use MMS model for other Philippine languages
+            logger.info(f"Using MMS model for language: {source_code}")
+            
+            # Prepare audio for MMS
+            inputs = mms_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+            logger.info("Audio processed for MMS, generating transcription...")
+            
+            with torch.no_grad():
+                # Process with MMS
+                logits = mms_model(**inputs).logits
                 predicted_ids = torch.argmax(logits, dim=-1)
-                transcription = stt_processor.batch_decode(predicted_ids)[0]
+                transcription = mms_processor.batch_decode(predicted_ids)[0]
+        
         logger.info(f"Transcription completed: {transcription}")
 
         # Step 4: Translate the transcribed text (MT)
-        source_code = LANGUAGE_MAPPING[source_lang]
-        target_code = LANGUAGE_MAPPING[target_lang]
-        
         if model_status["mt"] == "loaded" and mt_model is not None and mt_tokenizer is not None:
             try:
                 source_nllb_code = NLLB_LANGUAGE_CODES[source_code]
@@ -535,53 +592,21 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
         else:
             logger.warning("MT model not loaded, skipping translation")
 
-        # Step 5: Update TTS model if the target language doesn't match the current TTS language
-        if current_tts_language != target_code:
-            try:
-                logger.info(f"Updating TTS model for {target_code}...")
-                from transformers import VitsModel, AutoTokenizer
-                tts_model = VitsModel.from_pretrained(f"facebook/mms-tts-{target_code}")
-                tts_tokenizer = AutoTokenizer.from_pretrained(f"facebook/mms-tts-{target_code}")
-                tts_model.to(device)
-                current_tts_language = target_code
-                logger.info(f"TTS model updated to {target_code}")
-                model_status["tts"] = "loaded"
-            except Exception as e:
-                logger.error(f"Failed to load TTS model for {target_code}: {str(e)}")
-                try:
-                    logger.info("Falling back to MMS-TTS English model...")
-                    tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
-                    tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
-                    tts_model.to(device)
-                    current_tts_language = "eng"
-                    logger.info("Fallback TTS model loaded successfully")
-                    model_status["tts"] = "loaded (fallback)"
-                except Exception as e2:
-                    logger.error(f"Failed to load fallback TTS model: {str(e2)}")
-                    model_status["tts"] = "failed"
+        # Step 5: Check for inappropriate content
+        is_inappropriate = check_inappropriate_content(transcription) or check_inappropriate_content(translated_text)
+        if is_inappropriate:
+            logger.warning("Inappropriate content detected in audio transcription or translation")
 
         # Step 6: Convert translated text to speech (TTS)
-        if model_status["tts"].startswith("loaded") and tts_model is not None and tts_tokenizer is not None:
+        if load_tts_model_for_language(target_code):
             try:
-                inputs = tts_tokenizer(translated_text, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    output = tts_model(**inputs)
-                speech = output.waveform.cpu().numpy().squeeze()
-                speech = (speech * 32767).astype(np.int16)
-                sample_rate = tts_model.config.sampling_rate
-
-                # Save the audio as a WAV file
-                output_filename = f"{request_id}.wav"
-                output_path = os.path.join(AUDIO_DIR, output_filename)
-                save_pcm_to_wav(speech.tolist(), sample_rate, output_path)
-                logger.info(f"Saved synthesized audio to {output_path}")
-
-                # Generate a URL to the WAV file
-                output_audio_url = f"https://jerich-talklasapp.hf.space/audio_output/{output_filename}"
-                logger.info("TTS conversion completed")
+                output_path, error = synthesize_speech(translated_text, target_code)
+                if output_path:
+                    output_filename = os.path.basename(output_path)
+                    output_audio_url = f"https://legendary-halibut-4p76969wqgr27xjw-8000.app.github.dev/audio_output/{output_filename}"
+                    logger.info("TTS conversion completed")
             except Exception as e:
                 logger.error(f"Error during TTS conversion: {str(e)}")
-                output_audio_url = None
         
         return {
             "request_id": request_id,
@@ -589,7 +614,8 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
             "message": "Transcription, translation, and TTS completed (or partially completed).",
             "source_text": transcription,
             "translated_text": translated_text,
-            "output_audio": output_audio_url
+            "output_audio": output_audio_url,
+            "is_inappropriate": is_inappropriate
         }
     except Exception as e:
         logger.error(f"Error during processing: {str(e)}")
@@ -599,11 +625,55 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
             "message": f"Processing failed: {str(e)}",
             "source_text": transcription,
             "translated_text": translated_text,
-            "output_audio": output_audio_url
+            "output_audio": output_audio_url,
+            "is_inappropriate": is_inappropriate
         }
     finally:
         logger.info(f"Cleaning up temporary file: {temp_path}")
         os.unlink(temp_path)
+
+@app.post("/text-to-speech")
+async def text_to_speech(text: str = Form(...), target_lang: str = Form(...)):
+    """Endpoint to convert text to speech in the specified language"""
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    if target_lang not in LANGUAGE_MAPPING:
+        raise HTTPException(status_code=400, detail="Invalid language selected")
+    
+    logger.info(f"Text-to-speech requested for text in {target_lang}")
+    request_id = str(uuid.uuid4())
+    
+    target_code = LANGUAGE_MAPPING[target_lang]
+    
+    # Check for inappropriate content
+    is_inappropriate = check_inappropriate_content(text)
+    if is_inappropriate:
+        logger.warning("Inappropriate content detected in text-to-speech request")
+    
+    # Synthesize speech
+    output_audio_url = None
+    if model_status["tts"].startswith("loaded") or load_tts_model_for_language(target_code):
+        try:
+            output_path, error = synthesize_speech(text, target_code)
+            if output_path:
+                output_filename = os.path.basename(output_path)
+                output_audio_url = f"https://legendary-halibut-4p76969wqgr27xjw-8000.app.github.dev/audio_output/{output_filename}"
+                logger.info("TTS conversion completed")
+            else:
+                logger.error(f"TTS conversion failed: {error}")
+        except Exception as e:
+            logger.error(f"Error during TTS conversion: {str(e)}")
+    else:
+        logger.warning("TTS model not loaded and could not be loaded")
+    
+    return {
+        "request_id": request_id,
+        "status": "completed" if output_audio_url else "failed",
+        "message": "TTS completed" if output_audio_url else "TTS failed",
+        "text": text,
+        "output_audio": output_audio_url,
+        "is_inappropriate": is_inappropriate
+    }
 
 if __name__ == "__main__":
     import uvicorn
