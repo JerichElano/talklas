@@ -7,3 +7,4 @@ torchaudio
 numpy
 python-multipart
 pydantic
+hf_xet
