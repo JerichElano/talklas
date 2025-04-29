@@ -25,6 +25,7 @@ FROM python:3.10-slim
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libsndfile.so* /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/bin/ffmpeg /usr/bin/
+COPY --from=builder /usr/local/bin/uvicorn /usr/local/bin/
 
 WORKDIR /app
 
@@ -41,8 +42,8 @@ ENV HOME=/root \
     PYTHONPATH=/usr/local/lib/python3.10/site-packages \
     PATH="/usr/local/bin:/usr/bin:$PATH"
 
-# Copy your app
-COPY . .
+# Copy your app files
+COPY app.py model_manager.py ./
 
 EXPOSE 8000
 
