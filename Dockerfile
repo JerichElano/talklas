@@ -10,31 +10,36 @@ RUN apt-get update && apt-get install -y \
 # Set the working directory
 WORKDIR /app
 
-# Copy requirements
+# Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies with optimizations
+RUN pip install --no-cache-dir -r requirements.txt \
+    && find /usr/local/lib/python3.10/site-packages -name "*.pyc" -delete \
+    && find /usr/local/lib/python3.10/site-packages -name "__pycache__" -delete
 
 # Final stage
 FROM python:3.10-slim
 
-# Copy installed packages from builder
+# Copy only necessary files from builder
 COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
 COPY --from=builder /usr/lib/x86_64-linux-gnu/libsndfile.so* /usr/lib/x86_64-linux-gnu/
 COPY --from=builder /usr/bin/ffmpeg /usr/bin/
 
 WORKDIR /app
 
-# Create the Hugging Face cache directory
-RUN mkdir -p /tmp/hf_cache && chmod -R 777 /tmp/hf_cache
+# Create HF cache directory and install minimal requirements
+RUN mkdir -p /tmp/hf_cache \
+    && chmod -R 777 /tmp/hf_cache \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set environment variables
-ENV HOME=/root
-ENV HF_HOME=/tmp/hf_cache
-
-# Install uvicorn in the final stage
-RUN pip install --no-cache-dir uvicorn
+ENV HOME=/root \
+    HF_HOME=/tmp/hf_cache \
+    PYTHONPATH=/usr/local/lib/python3.10/site-packages \
+    PATH="/usr/local/bin:/usr/bin:$PATH"
 
 # Copy your app
 COPY . .
