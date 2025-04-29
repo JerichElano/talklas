@@ -1,0 +1,9 @@
+fastapi==0.111.0
+uvicorn==0.30.1
+transformers==4.44.2
+torch
+soundfile
+torchaudio
+numpy
+python-multipart
+pydantic
