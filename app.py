@@ -62,7 +62,8 @@ COMMON_PHRASES = {
     "thank you": {"eng": "Thank you", "tgl": "Salamat", "ceb": "Salamat", "ilo": "Agyamanak", "war": "Salamat", "pag": "Salamat"},
     "how are you": {"eng": "How are you", "tgl": "Kumusta ka", "ceb": "Kumusta ka", "ilo": "Kumusta ka", "war": "Kumusta ka", "pag": "Kumusta ka"},
     "good morning": {"eng": "Good morning", "tgl": "Magandang umaga", "ceb": "Maayong buntag", "ilo": "Naimbag a bigat", "war": "Maupay nga aga", "pag": "Masanto ya kabwasan"},
-    "goodbye": {"eng": "Goodbye", "tgl": "Paalam", "ceb": "Paalam", "ilo": "Agpakada", "war": "Paaram", "pag": "Agya"}
+    "goodbye": {"eng": "Goodbye", "tgl": "Paalam", "ceb": "Paalam", "ilo": "Agpakada", "war": "Paaram", "pag": "Agya"},
+    "where do you live": {"eng": "Where do you live", "tgl": "Saan ka nakatira", "ceb": "Asa ka nagpuyo", "ilo": "Sadino ti pagnaedanmo", "war": "Diin ka naistar", "pag": "Inerman so abong mo"}
 }
 
 # Function to save PCM data as a WAV file
