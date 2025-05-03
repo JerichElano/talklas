@@ -12,27 +12,41 @@ import soundfile as sf
 import torchaudio
 import wave
 import time
-import re
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Optional, Tuple
 from datetime import datetime, timedelta
-from tenacity import retry, stop_after_attempt, wait_exponential
-import requests.exceptions
-from model_manager import ModelManager
+from fuzzywuzzy import fuzz
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("talklas-api")
+logger = logging.getLogger("talklas-simplified-api")
 
-app = FastAPI(title="Talklas API")
+app = FastAPI(title="Talklas Simplified API")
 
+# Mount a directory to serve audio files
 AUDIO_DIR = "/tmp/audio_output"
 os.makedirs(AUDIO_DIR, exist_ok=True)
 app.mount("/audio_output", StaticFiles(directory=AUDIO_DIR), name="audio_output")
 
-model_manager = ModelManager(max_idle_time=300, memory_check_interval=60)
+# Global variables to track application state
+models_loaded = False
+loading_in_progress = False
+model_status = {
+    "stt_whisper": "not_loaded",
+    "tts": "not_loaded"
+}
+error_message = None
+current_tts_language = "eng"
 
+# Model instances
+whisper_processor = None
+whisper_model = None
+tts_model = None
+tts_tokenizer = None
+
+# Define valid languages
 LANGUAGE_MAPPING = {
     "English": "eng",
     "Tagalog": "tgl",
@@ -42,34 +56,16 @@ LANGUAGE_MAPPING = {
     "Pangasinan": "pag"
 }
 
-WHISPER_LANGUAGES = {"eng", "tgl"}
-MMS_LANGUAGES = {"ceb", "ilo", "war", "pag"}
-
-NLLB_LANGUAGE_CODES = {
-    "eng": "eng_Latn",
-    "tgl": "tgl_Latn",
-    "ceb": "ceb_Latn",
-    "ilo": "ilo_Latn",
-    "war": "war_Latn",
-    "pag": "pag_Latn"
+# Common phrases and their translations
+COMMON_PHRASES = {
+    "hello": {"eng": "Hello", "tgl": "Kamusta", "ceb": "Kumusta", "ilo": "Hello", "war": "Kamusta", "pag": "Kumusta"},
+    "thank you": {"eng": "Thank you", "tgl": "Salamat", "ceb": "Salamat", "ilo": "Agyamanak", "war": "Salamat", "pag": "Salamat"},
+    "how are you": {"eng": "How are you", "tgl": "Kumusta ka", "ceb": "Kumusta ka", "ilo": "Kumusta ka", "war": "Kumusta ka", "pag": "Kumusta ka"},
+    "good morning": {"eng": "Good morning", "tgl": "Magandang umaga", "ceb": "Maayong buntag", "ilo": "Naimbag a bigat", "war": "Maupay nga aga", "pag": "Masanto ya kabwasan"},
+    "goodbye": {"eng": "Goodbye", "tgl": "Paalam", "ceb": "Paalam", "ilo": "Agpakada", "war": "Paaram", "pag": "Agya"}
 }
 
-INAPPROPRIATE_WORDS = [
-    "fuck", "shit", "bitch", "ass", "damn", "hell", "bastard", "cunt", "son of a bitch", "dick", "pussy", "motherfucker",
-    "agka baboy", "puta", "putang ina", "gago", "tanga", "hayop", "ulol", "lintik", "animal ka",
-    "paki", "pakyu", "yawa", "bungol", "gingan", "yawa ka", "peste", "irig",
-    "pakit", "ayat", "pua", "kayat mo ti agsardeng", "hinampak", "iring ka"
-]
-
-def check_inappropriate_content(text: str) -> bool:
-    text_lower = text.lower()
-    for word in INAPPROPRIATE_WORDS:
-        pattern = r'\b' + re.escape(word) + r'\b'
-        if re.search(pattern, text_lower):
-            logger.warning(f"Inappropriate content detected: {word}")
-            return True
-    return False
-
+# Function to save PCM data as a WAV file
 def save_pcm_to_wav(pcm_data: list, sample_rate: int, output_path: str):
     pcm_array = np.array(pcm_data, dtype=np.int16)
     with wave.open(output_path, 'wb') as wav_file:
@@ -78,7 +74,8 @@ def save_pcm_to_wav(pcm_data: list, sample_rate: int, output_path: str):
         wav_file.setframerate(sample_rate)
         wav_file.writeframes(pcm_array.tobytes())
 
-def detect_speech(waveform: torch.Tensor, sample_rate: int, threshold: float = 0.01, min_speech_duration: float = 0.5) -> bool:
+# Function to detect speech using an energy-based approach
+def detect_speech(waveform: torch.Tensor, sample_rate: int, threshold: float = 0.01) -> bool:
     waveform_np = waveform.numpy()
     if waveform_np.ndim > 1:
         waveform_np = waveform_np.mean(axis=0)
@@ -89,6 +86,7 @@ def detect_speech(waveform: torch.Tensor, sample_rate: int, threshold: float = 0
         return False
     return True
 
+# Function to clean up old audio files
 def cleanup_old_audio_files():
     logger.info("Starting cleanup of old audio files...")
     expiration_time = datetime.now() - timedelta(minutes=10)
@@ -103,165 +101,175 @@ def cleanup_old_audio_files():
                 except Exception as e:
                     logger.error(f"Error deleting file {file_path}: {str(e)}")
 
+# Background task to periodically clean up audio files
 def schedule_cleanup():
     while True:
         cleanup_old_audio_files()
         time.sleep(300)
 
-def synthesize_speech(text: str, target_code: str) -> Tuple[Optional[str], Optional[str]]:
-    tts_model_name = f"tts_{target_code}"
-    tts_model = model_manager.get_model(tts_model_name)
-    tts_tokenizer = model_manager.get_tokenizer(tts_model_name)
+# Function to load models in background
+def load_models_task():
+    global models_loaded, loading_in_progress, model_status, error_message
+    global whisper_processor, whisper_model, tts_model, tts_tokenizer
     
-    if tts_model is None or tts_tokenizer is None:
-        return None, f"Failed to load TTS model for {target_code}"
+    try:
+        loading_in_progress = True
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Load Whisper STT model
+        logger.info("Loading Whisper STT model...")
+        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+        try:
+            model_status["stt_whisper"] = "loading"
+            whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+            whisper_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+            whisper_model.to(device)
+            logger.info("Whisper STT model loaded successfully")
+            model_status["stt_whisper"] = "loaded"
+        except Exception as e:
+            logger.error(f"Failed to load Whisper STT model: {str(e)}")
+            model_status["stt_whisper"] = "failed"
+            error_message = f"Whisper STT model loading failed: {str(e)}"
+            return
+        
+        # Load TTS model (default to English)
+        logger.info("Loading MMS-TTS model for English...")
+        from transformers import VitsModel, AutoTokenizer
+        try:
+            model_status["tts"] = "loading"
+            tts_model = VitsModel.from_pretrained("facebook/mms-tts-eng")
+            tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-eng")
+            tts_model.to(device)
+            logger.info("TTS model loaded successfully")
+            model_status["tts"] = "loaded"
+        except Exception as e:
+            logger.error(f"Failed to load TTS model: {str(e)}")
+            model_status["tts"] = "failed"
+            error_message = f"TTS model loading failed: {str(e)}"
+            return
+        
+        models_loaded = True
+        logger.info("Model loading completed successfully")
+        
+    except Exception as e:
+        error_message = str(e)
+        logger.error(f"Error in model loading task: {str(e)}")
+    finally:
+        loading_in_progress = False
+
+# Start loading models in background
+def start_model_loading():
+    global loading_in_progress, models_loaded
+    if not loading_in_progress and not models_loaded:
+        loading_in_progress = True
+        loading_thread = threading.Thread(target=load_models_task)
+        loading_thread.daemon = True
+        loading_thread.start()
+
+# Start the background cleanup task
+def start_cleanup_task():
+    cleanup_thread = threading.Thread(target=schedule_cleanup)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+
+# Function to load or update TTS model for a specific language
+def load_tts_model_for_language(target_code: str) -> bool:
+    global tts_model, tts_tokenizer, current_tts_language, model_status
+    
+    if target_code not in LANGUAGE_MAPPING.values():
+        logger.error(f"Invalid language code: {target_code}")
+        return False
+    
+    if current_tts_language == target_code and model_status["tts"].startswith("loaded"):
+        logger.info(f"TTS model for {target_code} is already loaded.")
+        return True
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        logger.info(f"Loading MMS-TTS model for {target_code}...")
+        from transformers import VitsModel, AutoTokenizer
+        tts_model = VitsModel.from_pretrained(f"facebook/mms-tts-{target_code}")
+        tts_tokenizer = AutoTokenizer.from_pretrained(f"facebook/mms-tts-{target_code}")
+        tts_model.to(device)
+        current_tts_language = target_code
+        logger.info(f"TTS model updated to {target_code}")
+        model_status["tts"] = "loaded"
+        return True
+    except Exception as e:
+        logger.error(f"Failed to load TTS model for {target_code}: {str(e)}")
+        model_status["tts"] = "failed"
+        return False
+
+# Function to find a matching phrase
+def find_matching_phrase(transcription: str, source_code: str) -> Tuple[Optional[str], Optional[str]]:
+    transcription = transcription.lower().strip()
+    best_match = None
+    best_score = 0
+    threshold = 80  # Fuzzy matching threshold
+    
+    for phrase_key, translations in COMMON_PHRASES.items():
+        source_phrase = translations.get(source_code, "").lower()
+        if source_phrase:
+            score = fuzz.ratio(transcription, source_phrase)
+            if score > best_score and score >= threshold:
+                best_score = score
+                best_match = phrase_key
+    
+    if best_match:
+        logger.info(f"Matched phrase: {best_match} (score: {best_score})")
+        return best_match, COMMON_PHRASES[best_match]
+    else:
+        logger.info("No matching phrase found")
+        return None, None
+
+# Function to synthesize speech from text
+def synthesize_speech(text: str, target_code: str) -> Tuple[Optional[str], Optional[str]]:
+    global tts_model, tts_tokenizer
     
     request_id = str(uuid.uuid4())
     output_path = os.path.join(AUDIO_DIR, f"{request_id}.wav")
     
+    if not load_tts_model_for_language(target_code):
+        return None, "Failed to load TTS model for the target language"
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
-        model_manager.use_model(tts_model_name)
         inputs = tts_tokenizer(text, return_tensors="pt").to(device)
         with torch.no_grad():
             output = tts_model(**inputs)
         speech = output.waveform.cpu().numpy().squeeze()
         speech = (speech * 32767).astype(np.int16)
         sample_rate = tts_model.config.sampling_rate
+
         save_pcm_to_wav(speech.tolist(), sample_rate, output_path)
         logger.info(f"Saved synthesized audio to {output_path}")
+        
         return output_path, None
     except Exception as e:
         error_msg = f"Error during TTS conversion: {str(e)}"
         logger.error(error_msg)
         return None, error_msg
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry_error_callback=lambda retry_state: False
-)
-async def load_model_with_retry(model_name: str, model_manager: ModelManager) -> bool:
-    try:
-        success = model_manager.load_model(model_name)
-        if success:
-            logger.info(f"Successfully loaded {model_name}")
-            return True
-        raise Exception(f"Failed to load {model_name}")
-    except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
-        logger.error(f"Network error loading {model_name}: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Error loading {model_name}: {str(e)}")
-        raise
-
+# Start the background processes when the app starts
 @app.on_event("startup")
 async def startup_event():
     logger.info("Application starting up...")
-    
-    cleanup_thread = threading.Thread(target=schedule_cleanup)
-    cleanup_thread.daemon = True
-    cleanup_thread.start()
-    
-    # Pre-load STT models
-    default_models = [
-        "stt_whisper",
-        "stt_mms"
-    ]
-    
-    for model_name in default_models:
-        try:
-            logger.info(f"Pre-loading STT model: {model_name}")
-            success = await load_model_with_retry(model_name, model_manager)
-            if not success:
-                logger.error(f"Failed to pre-load {model_name} after retries")
-            else:
-                model_manager.mark_default(model_name)
-        except Exception as e:
-            logger.error(f"Error pre-loading {model_name}: {str(e)}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Application shutting down...")
-    model_manager.shutdown()
-
-@app.get("/")
-async def root():
-    logger.info("Root endpoint requested")
-    return {"status": "healthy"}
+    start_model_loading()
+    start_cleanup_task()
 
 @app.get("/health")
 async def health_check():
     logger.info("Health check requested")
     return {
         "status": "healthy",
-        "model_status": model_manager.get_model_status()
+        "models_loaded": models_loaded,
+        "loading_in_progress": loading_in_progress,
+        "model_status": model_status,
+        "error": error_message
     }
 
-@app.post("/translate-text")
-async def translate_text(text: str = Form(...), source_lang: str = Form(...), target_lang: str = Form(...)):
-    if not text:
-        raise HTTPException(status_code=400, detail="No text provided")
-    if source_lang not in LANGUAGE_MAPPING or target_lang not in LANGUAGE_MAPPING:
-        raise HTTPException(status_code=400, detail="Invalid language selected")
-    
-    logger.info(f"Translate-text requested: {text} from {source_lang} to {target_lang}")
-    request_id = str(uuid.uuid4())
-    
-    source_code = LANGUAGE_MAPPING[source_lang]
-    target_code = LANGUAGE_MAPPING[target_lang]
-    translated_text = "Translation not available"
-    
-    mt_model = model_manager.get_model("mt")
-    mt_tokenizer = model_manager.get_tokenizer("mt")
-    
-    if mt_model is not None and mt_tokenizer is not None:
-        try:
-            model_manager.use_model("mt")
-            source_nllb_code = NLLB_LANGUAGE_CODES[source_code]
-            target_nllb_code = NLLB_LANGUAGE_CODES[target_code]
-            mt_tokenizer.src_lang = source_nllb_code
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            inputs = mt_tokenizer(text, return_tensors="pt").to(device)
-            with torch.no_grad():
-                generated_tokens = mt_model.generate(
-                    **inputs,
-                    forced_bos_token_id=mt_tokenizer.convert_tokens_to_ids(target_nllb_code),
-                    max_length=448
-                )
-            translated_text = mt_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
-            logger.info(f"Translation completed: {translated_text}")
-        except Exception as e:
-            logger.error(f"Error during translation: {str(e)}")
-            translated_text = f"Translation failed: {str(e)}"
-    else:
-        logger.warning("MT model not loaded, skipping translation")
-
-    is_inappropriate = check_inappropriate_content(text) or check_inappropriate_content(translated_text)
-    if is_inappropriate:
-        logger.warning("Inappropriate content detected in translation request")
-
-    output_audio_url = None
-    output_path, error = synthesize_speech(translated_text, target_code)
-    if output_path:
-        output_filename = os.path.basename(output_path)
-        output_audio_url = f"https://legendary-halibut-4p76969wqgr27xjw-8000.app.github.dev/audio_output/{output_filename}"
-        logger.info("TTS conversion completed")
-    else:
-        logger.error(f"TTS conversion failed: {error}")
-    
-    return {
-        "request_id": request_id,
-        "status": "completed",
-        "message": "Translation and TTS completed (or partially completed).",
-        "source_text": text,
-        "translated_text": translated_text,
-        "output_audio": output_audio_url,
-        "is_inappropriate": is_inappropriate
-    }
-
-@app.post("/translate-audio")
-async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form(...), target_lang: str = Form(...)):
+@app.post("/process-audio")
+async def process_audio(audio: UploadFile = File(...), source_lang: str = Form(...), target_lang: str = Form(...)):
     if not audio:
         raise HTTPException(status_code=400, detail="No audio file provided")
     if source_lang not in LANGUAGE_MAPPING or target_lang not in LANGUAGE_MAPPING:
@@ -270,147 +278,106 @@ async def translate_audio(audio: UploadFile = File(...), source_lang: str = Form
     source_code = LANGUAGE_MAPPING[source_lang]
     target_code = LANGUAGE_MAPPING[target_lang]
     
-    logger.info(f"Translate-audio requested: {audio.filename} from {source_lang} ({source_code}) to {target_lang} ({target_code})")
+    logger.info(f"Process-audio requested: {audio.filename} from {source_lang} ({source_code}) to {target_lang} ({target_code})")
     request_id = str(uuid.uuid4())
     
-    # Determine which STT model to use
-    use_whisper = source_code in WHISPER_LANGUAGES
-    stt_model_name = "stt_whisper" if use_whisper else "stt_mms"
-    
-    # Ensure only the needed STT model is loaded
-    model_manager.mark_default(stt_model_name)
-    model_manager.restore_default_models()
-    
-    # Get STT model
-    stt_model = model_manager.get_model(stt_model_name)
-    stt_processor = model_manager.get_tokenizer(stt_model_name)
-    
-    if stt_model is None or stt_processor is None:
-        model_manager.restore_default_models()
+    if model_status["stt_whisper"] != "loaded" or whisper_processor is None or whisper_model is None:
+        logger.warning("Whisper STT model not loaded")
         return {
             "request_id": request_id,
-            "status": "failed",
-            "message": f"Failed to load {stt_model_name} model",
+            "status": "processing",
+            "message": "Whisper STT model not loaded yet. Please try again later.",
             "source_text": "Transcription not available",
             "translated_text": "Translation not available",
-            "output_audio": None,
-            "is_inappropriate": False
+            "output_audio": None
         }
-
-    # Save uploaded audio
+    
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
         temp_file.write(await audio.read())
         temp_path = temp_file.name
-
+    
     transcription = "Transcription not available"
     translated_text = "Translation not available"
     output_audio_url = None
-    is_inappropriate = False
-
+    
     try:
-        # Process audio
+        # Load and resample audio
+        logger.info(f"Reading audio file: {temp_path}")
         waveform, sample_rate = torchaudio.load(temp_path)
         if sample_rate != 16000:
+            logger.info(f"Resampling audio from {sample_rate} Hz to 16000 Hz")
             resampler = torchaudio.transforms.Resample(sample_rate, 16000)
             waveform = resampler(waveform)
             sample_rate = 16000
 
+        # Detect speech
         if not detect_speech(waveform, sample_rate):
-            model_manager.restore_default_models()
             return {
                 "request_id": request_id,
                 "status": "failed",
                 "message": "No speech detected in the audio.",
                 "source_text": "No speech detected",
                 "translated_text": "No translation available",
-                "output_audio": None,
-                "is_inappropriate": False
+                "output_audio": None
             }
 
-        model_manager.use_model(stt_model_name)
+        # Transcribe audio using Whisper
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        
-        # Transcribe
-        if use_whisper:
-            inputs = stt_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
-            with torch.no_grad():
-                forced_language = "en" if source_code == "eng" else "tl"
-                generated_ids = stt_model.generate(**inputs, language=forced_language, task="transcribe")
-                transcription = stt_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        else:
-            inputs = stt_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
-            with torch.no_grad():
-                logits = stt_model(**inputs).logits
-                predicted_ids = torch.argmax(logits, dim=-1)
-                transcription = stt_processor.batch_decode(predicted_ids)[0]
-
+        logger.info(f"Using Whisper model for language: {source_code}")
+        inputs = whisper_processor(waveform.numpy(), sampling_rate=16000, return_tensors="pt").to(device)
+        with torch.no_grad():
+            forced_language = "en" if source_code == "eng" else "tl"
+            generated_ids = whisper_model.generate(
+                **inputs, 
+                language=forced_language,
+                task="transcribe"
+            )
+            transcription = whisper_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         logger.info(f"Transcription completed: {transcription}")
 
-        # Unload STT and load MT
-        model_manager.unload_model(stt_model_name)
-        mt_model = model_manager.get_model("mt")
-        mt_tokenizer = model_manager.get_tokenizer("mt")
+        # Find matching phrase
+        matched_phrase_key, translations = find_matching_phrase(transcription, source_code)
+        if matched_phrase_key and translations:
+            translated_text = translations.get(target_code, translations["eng"])
+            logger.info(f"Using matched translation: {translated_text}")
+        else:
+            translated_text = "No matching phrase found"
+            logger.info("No matching phrase, using default message")
 
-        if mt_model is not None and mt_tokenizer is not None:
+        # Convert to speech
+        if load_tts_model_for_language(target_code):
             try:
-                model_manager.use_model("mt")
-                source_nllb_code = NLLB_LANGUAGE_CODES[source_code]
-                target_nllb_code = NLLB_LANGUAGE_CODES[target_code]
-                mt_tokenizer.src_lang = source_nllb_code
-                inputs = mt_tokenizer(transcription, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    generated_tokens = mt_model.generate(
-                        **inputs,
-                        forced_bos_token_id=mt_tokenizer.convert_tokens_to_ids(target_nllb_code),
-                        max_length=448
-                    )
-                translated_text = mt_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
-                logger.info(f"Translation completed: {translated_text}")
+                output_path, error = synthesize_speech(translated_text, target_code)
+                if output_path:
+                    output_filename = os.path.basename(output_path)
+                    output_audio_url = f"/audio_output/{output_filename}"  # Relative URL for simplicity
+                    logger.info("TTS conversion completed")
             except Exception as e:
-                logger.error(f"Error during translation: {str(e)}")
-                translated_text = f"Translation failed: {str(e)}"
-
-        # Unload MT and load TTS
-        model_manager.unload_model("mt")
-        is_inappropriate = check_inappropriate_content(transcription) or check_inappropriate_content(translated_text)
-        if is_inappropriate:
-            logger.warning("Inappropriate content detected")
-
-        if not is_inappropriate:
-            output_path, error = synthesize_speech(translated_text, target_code)
-            if output_path:
-                output_filename = os.path.basename(output_path)
-                output_audio_url = f"https://legendary-halibut-4p76969wqgr27xjw-8000.app.github.dev/audio_output/{output_filename}"
-                logger.info("TTS conversion completed")
-
-        # Unload TTS and restore default STT
-        model_manager.unload_model(f"tts_{target_code}")
-        model_manager.restore_default_models()
-
+                logger.error(f"Error during TTS conversion: {str(e)}")
+        
         return {
             "request_id": request_id,
             "status": "completed",
-            "message": "Processing completed successfully",
+            "message": "Transcription, phrase matching, and TTS completed.",
             "source_text": transcription,
             "translated_text": translated_text,
-            "output_audio": output_audio_url,
-            "is_inappropriate": is_inappropriate
+            "output_audio": output_audio_url
         }
-
     except Exception as e:
         logger.error(f"Error during processing: {str(e)}")
-        model_manager.restore_default_models()
         return {
             "request_id": request_id,
             "status": "failed",
             "message": f"Processing failed: {str(e)}",
             "source_text": transcription,
             "translated_text": translated_text,
-            "output_audio": output_audio_url,
-            "is_inappropriate": is_inappropriate
+            "output_audio": output_audio_url
         }
     finally:
-        try:
-            os.unlink(temp_path)
-        except Exception as e:
-            logger.error(f"Error removing temporary file: {str(e)}")
+        logger.info(f"Cleaning up temporary file: {temp_path}")
+        os.unlink(temp_path)
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting Uvicorn server...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
